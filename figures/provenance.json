@@ -1,0 +1,14 @@
+{
+  "source_sha256": {
+    "trainer_deocclusion_pseudo.py": "81238dba3572574d02130930dbebf41fe564da3276321f1ad7ba2837a472c888",
+    "trainer_deocclusion_pseudo_decoder.py": "ec9f616e3336acca283a82a1fcf6fe7beb3d3c1a4a2b511ae2e69d320c906e12",
+    "app.py": "efdb7f560269c74eb992e5ffd83dd9b851bccdedfe24fbd385c789b6d258a37e",
+    "utils.py": "cf33f7dab12e6bc27a0f1ef4342100518dc28626c69f4ac7c29dfc720af615a4",
+    "configs/inpainter_ours_pseudo.yaml": "2df21ffcafb15333ccbfee66a92d6e63351913aaf56699ff5f9358a87a3228cb",
+    "configs/rgba_ours_pseudo.yaml": "05e296f7c3c674bc89591a70f072be6ebafae119f585c52a690296f309f3903a",
+    "../../pixart-alpha-amodal/figures/training.drawio": "678aff22d119984f7dc8698668424dc54ca503feb48fc055b9aaa1d3b02936a5"
+  },
+  "illustrations": "Existing PixArt reference sample 7058153; illustrative only, not a SynergyAmodal result.",
+  "condition_mask": "Exact complement of the embedded visible mask, nearest-resized to 64 by 64 with floor-coordinate sampling and embedded as SVG pixel runs.",
+  "noise_tiles": "Existing schematic reference tiles; not generated model predictions."
+}

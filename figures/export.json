@@ -1,0 +1,22 @@
+{
+  "exporter": "draw.io Desktop",
+  "scale": 1.5,
+  "files": [
+    {
+      "file": "training.png",
+      "bytes": 980386
+    },
+    {
+      "file": "training.svg",
+      "bytes": 2130426
+    },
+    {
+      "file": "inference.png",
+      "bytes": 1097620
+    },
+    {
+      "file": "inference.svg",
+      "bytes": 2636257
+    }
+  ]
+}

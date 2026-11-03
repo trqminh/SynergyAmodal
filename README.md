@@ -19,6 +19,82 @@
 
 - 😊 Our paper is accepted by ACMMM 2025.
 
+## Qualitative comparison: SynergyAmodal vs pretrained SD2 inpainting
+
+Local comparison run on **2026-10-30**: the released **SynergyAmodal EMA model**
+versus its pretrained **Stable Diffusion 2 inpainting** backbone. This comparison
+does not use the experimental PixArt model.
+
+There are **8 examples × 2 seeds × 2 text-CFG settings × 2 models = 64 generated
+images**. The first two examples reproduce the boat/player inputs from the
+PixArt training previews; the remaining six are deterministically selected
+Synergy16K cases. Every result is included below, without selecting the best seed.
+
+Columns: **scene → visible mask → dataset target → SD2 CFG 1 → Synergy CFG 1 →
+SD2 CFG 7.5 → Synergy CFG 7.5**. Click an image to inspect the full-size sheet.
+
+### Seed 45
+
+![Seed 45: boat, basketball player, tent, vegetables](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/comparison-seed-45-page-1.png)
+
+![Seed 45: soccer player, bus, horse, camper](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/comparison-seed-45-page-2.png)
+
+### Seed 46
+
+![Seed 46: boat, basketball player, tent, vegetables](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/comparison-seed-46-page-1.png)
+
+![Seed 46: soccer player, bus, horse, camper](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/comparison-seed-46-page-2.png)
+
+### Comparison protocol
+
+- Both models receive the same observed image, visible mask, caption, **actual
+  initial noise tensor**, and 25-step DDIM schedule (`999, 959, …, 39`) at 512px.
+  The inpainting mask is the complement of the visible-object mask.
+- Text CFG is matched at 1 and 7.5; Synergy's image CFG stays at 1. The models use
+  their native image conditioning: Synergy adds scene RGB and uses white outside
+  the visible object; SD2 uses its native zero-masked normalized RGB. This is a
+  comparison of the two models as designed, not a weights-only ablation.
+- These are **raw RGB outputs from one global pass**. There is no mask-decoder
+  cleanup, visible-pixel replacement, or final compositing. The demo's optional
+  second local refinement pass is not used. Targets are displayed only and are
+  never passed to either model.
+- The six additional crops are framed from the **visible mask only**, with a
+  50% margin and minimum source crop size of 512px. Selection uses annotated
+  hidden-area fractions of 15–75%. Dataset targets are pseudo-ground truth, and
+  these cases may overlap the released model's training set; this is not a
+  held-out benchmark.
+- SD2 weights come from the documented
+  [community mirror](https://huggingface.co/sd2-community/stable-diffusion-2-inpainting),
+  pinned to `5f74973cbb64c8568780732c17f43eb269d63a0d`, because the original
+  Stability AI endpoint is deprecated. Downloaded weight SHA256s were verified.
+  After legacy parameter-name conversion, all **248 VAE tensors and 372 text
+  encoder tensors match SynergyAmodal's stored frozen weights exactly**.
+
+**What these examples show:** SD2 inpainting already preserves substantial
+visible appearance, including the basketball player's blue uniform, but often
+fills the surrounding scene, enlarges objects, or invents extra structure.
+SynergyAmodal more consistently isolates and completes the requested object on
+white. It is not perfect: tent interiors and hidden player/horse details vary
+with seed and guidance. These examples support the distinction between generic
+inpainting capability and task-specific amodal completion; they do not establish
+that initialization alone explains the experimental PixArt model's failures.
+
+[Output directory and run notes](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/README.md) ·
+[Per-case records and checkpoint provenance](../all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison/run.json) ·
+[Reproduction script](scripts/compare_pretrained.py)
+
+From the parent workspace, using the existing environment and a free GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=4 \
+  /home/minht/miniconda3/envs/pix2ges/bin/python \
+  SynergyAmodal/scripts/compare_pretrained.py \
+  --output all_data/outputs/synergy_amodal/outputs/qualitative/pretrained-inpainting-comparison-new
+```
+
+The figures are local artifact links through `all_data`; they require this
+workspace's artifact directory and are not uploaded to GitHub.
+
 ## 🔧 Installation
 - create a new conda enviroment
 ```
