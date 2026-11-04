@@ -123,6 +123,29 @@ git clone https://github.com/imlixinyang/SynergyAmodal.git
 cd SynergyAmodal
 ```
 
+## Training outputs
+
+For this workspace, activate the training environment with:
+
+```bash
+conda activate /data/minht/TheGrid/hint-control-amodal-data/outputs/synergy_amodal/envs/synergyamodal
+```
+
+Both training scripts save logs and checkpoints under the parent workspace's
+`all_data/outputs/synergy_amodal/logs/` directory by default:
+
+```text
+all_data/outputs/synergy_amodal/logs/
+  <experiment_name>/lightning_logs/version_*/checkpoints/
+```
+
+Set `output_dir` in the training YAML or append
+`output_dir=/absolute/path/to/logs` to a training command to change the destination.
+Relative output paths are resolved from the `SynergyAmodal` repository directory.
+Lightning creates the run directories when training starts.
+The default experiment names end in `_ldm_reproduce` for RGB completion and
+`_vae_reproduce` for the mask decoder.
+
 ## Model
 Download the pre-trained model by:
 ```

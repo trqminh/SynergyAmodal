@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import os
+from pathlib import Path
 from pytorch_lightning import LightningModule, Trainer
 
 import warnings
@@ -26,9 +27,15 @@ class InpaintingTrainer(LightningModule):
         self.save_hyperparameters(opt)
         self.opt = opt    
         
-        # TOFIX
+        # Use the SD2 backbone already downloaded in the parent workspace.
+        backbone_dir = (
+            Path(__file__).resolve().parent.parent
+            / "all_data/outputs/synergy_amodal/cache/huggingface/"
+            "models--sd2-community--stable-diffusion-2-inpainting/snapshots/"
+            "5f74973cbb64c8568780732c17f43eb269d63a0d"
+        )
         pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-2-inpainting",
+            str(backbone_dir),
             torch_dtype=torch.float32,
             local_files_only=True,
         )
@@ -288,6 +295,10 @@ if __name__ == "__main__":
     # override default config from cli
     opt = OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_cli(extras))
 
+    output_dir = Path(opt.get('output_dir', '../all_data/outputs/synergy_amodal/logs')).expanduser()
+    if not output_dir.is_absolute():
+        output_dir = Path(__file__).resolve().parent / output_dir
+
     train_dataset = import_str(opt['dataset']['module'])(**opt['dataset']['args'])
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.training.batch_size, num_workers=opt.training.num_workers, shuffle=True, collate_fn=train_dataset.collate_fn)
         
@@ -295,7 +306,7 @@ if __name__ == "__main__":
 
     trainer = Trainer(
             callbacks=[ModelCheckpoint(every_n_train_steps=1000)],
-            default_root_dir=f"logs/{opt.experiment_name}",
+            default_root_dir=str(output_dir / opt.experiment_name),
             strategy='auto',
             max_steps=opt.training.max_steps,
             log_every_n_steps=1,

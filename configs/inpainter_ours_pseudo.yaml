@@ -1,4 +1,5 @@
-experiment_name: "sd2.1_deocclusion_ours_pseudo_ldm"
+experiment_name: "sd2.1_deocclusion_ours_pseudo_ldm_reproduce"
+output_dir: "../all_data/outputs/synergy_amodal/logs"
 
 training:
   learning_rate: 5e-5
