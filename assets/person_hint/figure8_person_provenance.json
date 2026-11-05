@@ -1,0 +1,18 @@
+{
+  "source": "https://arxiv.org/html/2504.19506v1/fig.control.compressed.png",
+  "source_local": "reports/assets/ambiguous_occlusion_reference/synergy_figure8.png",
+  "input_crop_box": [
+    0,
+    242,
+    226,
+    451
+  ],
+  "comparison_crop_box": [
+    0,
+    242,
+    2047,
+    494
+  ],
+  "status": "Preview only; no inference run",
+  "note": "Cropped directly from the published Figure 8. This is a low-resolution paper panel, not the original source photograph. Comparison outputs belong to SynergyAmodal."
+}

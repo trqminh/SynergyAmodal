@@ -1,0 +1,46 @@
+{
+  "model": "SAM ViT-H",
+  "checkpoint": "/data/minht/TheGrid/AmodalGen/all_data/prior_models/pix2ges/ckpt/sam_vit_h.pth",
+  "points": [
+    [
+      353,
+      393
+    ],
+    [
+      422,
+      465
+    ],
+    [
+      321,
+      426
+    ],
+    [
+      286,
+      401
+    ],
+    [
+      468,
+      390
+    ]
+  ],
+  "labels": [
+    1,
+    1,
+    1,
+    0,
+    0
+  ],
+  "box": [
+    301,
+    344,
+    446,
+    514
+  ],
+  "predicted_iou": [
+    0.8755860924720764,
+    0.9692703485488892,
+    0.9707350730895996
+  ],
+  "selection": "Visually inspected: covers visible body and hind legs, excludes structure and background.",
+  "selected_candidate": 2
+}

@@ -1,0 +1,38 @@
+{
+  "status": "USER_VERIFIED_AND_EVALUATED",
+  "completion_inference_run": true,
+  "source": "synergy_figure8.png",
+  "input_panel_box": [
+    0,
+    242,
+    226,
+    451
+  ],
+  "modal_panel_box": [
+    226,
+    242,
+    452,
+    451
+  ],
+  "modal_alignment_shift": [
+    3,
+    0
+  ],
+  "method": "Recover approximate mask from bright subject in the published modal panel: align panels, mean-RGB ratio threshold >0.60, select connected component containing pixel (130,80), fill internal holes.",
+  "includes": "Visible upper body, cap/head, hands and held award, following published modal selection.",
+  "excludes": "MVP sign, left person and background.",
+  "square_crop_box_in_input_panel": [
+    17,
+    0,
+    226,
+    209
+  ],
+  "output_size": [
+    512,
+    512
+  ],
+  "input_resampling": "Lanczos",
+  "mask_resampling": "Nearest neighbor",
+  "limitation": "Derived from the low-resolution published visualization; not the authors' original annotation. Upsampling adds no source detail.",
+  "evaluation": "all_data/outputs/amodal-adapter/person_hints_20261029"
+}
