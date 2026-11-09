@@ -3,6 +3,7 @@ import base64
 import copy
 import glob
 import io
+import json
 import os
 
 import cv2
@@ -21,12 +22,14 @@ SIZE = 512
 # Refinement crops from this canvas: the same layout as the 512 one, twice the size.
 FULL_SIZE = 1024
 
+SCRIBBLE, BOX = "Scribble", "Box"
+
 # A plain canvas, shown 1:1 over the image, so a canvas pixel is a hint pixel.
+# The canvas keeps both a scribble and a box; only the one for the current hint type is shown and drawn on.
 SKETCH_SCRIPT = """
 <script>
-function sketchRedraw(c) {
-    const g = c.getContext('2d');
-    g.clearRect(0, 0, c.width, c.height);
+window.hintMode = 'Scribble';
+function drawStrokes(c, g) {
     g.strokeStyle = '#fff';
     g.lineWidth = 2;
     g.lineCap = g.lineJoin = 'round';
@@ -37,20 +40,47 @@ function sketchRedraw(c) {
         g.stroke();
     }
 }
+function sketchRedraw(c) {
+    const g = c.getContext('2d');
+    g.clearRect(0, 0, c.width, c.height);
+    if (window.hintMode === 'Box') {
+        if (!c.box) return;
+        const [x0, y0, x1, y1] = c.box;
+        g.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        g.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+        g.strokeStyle = '#fff';
+        g.lineWidth = 2;
+        g.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    } else {
+        drawStrokes(c, g);
+    }
+}
 function sketchPoint(e) {
     const c = e.target, r = c.getBoundingClientRect();
     return [(e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height];
 }
+// The strokes alone, on a transparent canvas, so a box drawn in the other mode never becomes ink.
+function sketchInk(c) {
+    const ink = document.createElement('canvas');
+    ink.width = c.width;
+    ink.height = c.height;
+    drawStrokes(c, ink.getContext('2d'));
+    return ink.toDataURL();
+}
 document.addEventListener('pointerdown', e => {
     if (e.target.id !== 'sketch') return;
     e.target.setPointerCapture(e.pointerId);
-    e.target.strokes = [...(e.target.strokes || []), [sketchPoint(e)]];
+    const p = sketchPoint(e);
+    if (window.hintMode === 'Box') e.target.box = [...p, ...p];
+    else e.target.strokes = [...(e.target.strokes || []), [p]];
     e.target.drawing = true;
     sketchRedraw(e.target);
 });
 document.addEventListener('pointermove', e => {
     if (e.target.id !== 'sketch' || !e.target.drawing) return;
-    e.target.strokes.at(-1).push(sketchPoint(e));
+    const p = sketchPoint(e);
+    if (window.hintMode === 'Box') e.target.box = [e.target.box[0], e.target.box[1], ...p];
+    else e.target.strokes.at(-1).push(p);
     sketchRedraw(e.target);
 });
 document.addEventListener('pointerup', e => {
@@ -58,15 +88,33 @@ document.addEventListener('pointerup', e => {
 });
 </script>
 """
-UNDO_JS = "() => { const c = document.getElementById('sketch'); (c.strokes || []).pop(); sketchRedraw(c); }"
-CLEAR_JS = "() => { const c = document.getElementById('sketch'); c.strokes = []; sketchRedraw(c); }"
-# Sends the canvas to Python in place of the hidden sketch textbox.
-READ_SKETCH_JS = "(state, sketch, caption, cfg_text, strength, seed) => [state, document.getElementById('sketch').toDataURL(), caption, cfg_text, strength, seed]"
+UNDO_JS = """() => {
+    const c = document.getElementById('sketch');
+    if (window.hintMode === 'Box') c.box = null; else (c.strokes || []).pop();
+    sketchRedraw(c);
+}"""
+CLEAR_JS = """() => {
+    const c = document.getElementById('sketch');
+    if (window.hintMode === 'Box') c.box = null; else c.strokes = [];
+    sketchRedraw(c);
+}"""
+SET_MODE_JS = "(mode) => { window.hintMode = mode; const c = document.getElementById('sketch'); if (c) sketchRedraw(c); }"
+# Sends the strokes and the box to Python in place of the hidden sketch textbox.
+READ_SKETCH_JS = """(state, sketch, hint_type, caption, cfg_text, strength, seed) => {
+    const c = document.getElementById('sketch');
+    const sketchJson = JSON.stringify({ink: sketchInk(c), box: c.box || null});
+    return [state, sketchJson, hint_type, caption, cfg_text, strength, seed];
+}"""
 
 system = None
+# One ControlNet per hint type, all on the same frozen UNet.
+controlnets = {}
 mask_decoder = None
 zim = None
 examples = None
+# The box dataset's dev records, keyed by sample ID without the s_/b_ prefix.
+box_examples = None
+box_example_index = {}
 device = None
 
 
@@ -107,6 +155,36 @@ def scribble_to_lines(ink, visible, valid):
     # Same as normalize_user_scribble: one pixel wide, and nothing on the visible
     # object, because training hints only cover the occluded part.
     return thin(ink) & valid & ~visible
+
+
+def box_to_map(box, valid):
+    # Same as box_map in amodal_data/operations/box.py: the box filled, clipped to the canvas,
+    # and empty off the valid canvas. Unlike a scribble, it may cover the visible object.
+    h, w = valid.shape
+    xs, ys = sorted([box[0], box[2]]), sorted([box[1], box[3]])
+    x0, x1 = max(0, round(xs[0])), min(w, round(xs[1]))
+    y0, y1 = max(0, round(ys[0])), min(h, round(ys[1]))
+    out = np.zeros((h, w), bool)
+    out[y0:max(y0, y1), x0:max(x0, x1)] = True
+    return out & valid
+
+
+def tight_box_map(mask):
+    # The filled box around a mask, to make a resized box a clean rectangle again.
+    out = np.zeros_like(mask, dtype=bool)
+    if mask.any():
+        ys, xs = np.nonzero(mask)
+        out[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = True
+    return out
+
+
+def use_hint(kind):
+    # Routes inference through the ControlNet for this hint type, or through the plain UNet for None.
+    if kind is None:
+        system.inference_ddim = lambda *args, hint=None, **kwargs: InpaintingTrainer.inference_ddim(system, *args, **kwargs)
+    else:
+        system.controlnet = controlnets[kind]
+        system.inference_ddim = lambda *args, **kwargs: ControlNetTrainer.inference_ddim(system, *args, **kwargs)
 
 
 def letterbox(image, size=SIZE):
@@ -173,11 +251,18 @@ def load_image(image):
         "full_visible": None,
         "points": [],
         "labels": [],
+        "training_hints": {},
     }
     return state, highlight(state), blank_canvas(state), None
 
 
-def load_example(index):
+def show_training_hint(state, hint_type):
+    if state is None:
+        return None
+    return state["training_hints"].get(hint_type)
+
+
+def load_example(index, hint_type):
     sample = examples[int(index)]
     record = examples.records[int(index)]
     rgb = to_uint8(sample["image"])
@@ -193,9 +278,13 @@ def load_example(index):
         "full_visible": resize_mask(visible, FULL_SIZE),
         "points": [],
         "labels": [],
+        # The box dataset has the same observation for this object, so both training hints can be shown.
+        "training_hints": {SCRIBBLE: (sample["hint"][0].numpy() * 255).astype(np.uint8)},
     }
-    training_hint = (sample["hint"][0].numpy() * 255).astype(np.uint8)
-    return state, highlight(state), blank_canvas(state), training_hint, sample["caption"]
+    box_index = box_example_index.get(record["identity"]["sample_id"].split("_", 1)[1])
+    if box_index is not None:
+        state["training_hints"][BOX] = (box_examples[box_index]["hint"][0].numpy() * 255).astype(np.uint8)
+    return state, highlight(state), blank_canvas(state), show_training_hint(state, hint_type), sample["caption"]
 
 
 def select_object(state, point_type, evt: gr.SelectData):
@@ -228,18 +317,28 @@ def decode_mask(latent, *args):
 
 
 @torch.no_grad()
-def generate(state, sketch, caption, cfg_text, strength, seed):
+def generate(state, sketch, hint_type, caption, cfg_text, strength, seed):
     if state is None or state["visible"] is None:
         raise gr.Error("Upload an image and select the object first.")
 
-    # Only where the pen touched counts. Thinning takes care of the stroke width.
-    ink = np.array(Image.open(io.BytesIO(base64.b64decode(sketch.split(",", 1)[1]))).convert("RGBA"))[..., 3] > 0
-
-    lines = scribble_to_lines(ink, state["visible"], state["valid"])
-    if ink.any() and not lines.any():
-        raise gr.Error("Draw in the occluded part, outside the highlighted object.")
-    # An empty canvas sends an all-black hint through the ControlNet.
-    sketched = lines.any()
+    sketch = json.loads(sketch)
+    if hint_type == BOX:
+        lines = np.zeros_like(state["valid"]) if sketch["box"] is None else box_to_map(sketch["box"], state["valid"])
+        sketched = lines.any()
+        # The box ControlNet never saw an empty hint and reads one as "nothing is hidden",
+        # so with no box the plain SynergyAmodal UNet runs instead.
+        use_hint(BOX if sketched else None)
+        if not sketched:
+            gr.Info("No box drawn, so the plain SynergyAmodal UNet was used.")
+    else:
+        # Only where the pen touched counts. Thinning takes care of the stroke width.
+        ink = np.array(Image.open(io.BytesIO(base64.b64decode(sketch["ink"].split(",", 1)[1]))).convert("RGBA"))[..., 3] > 0
+        lines = scribble_to_lines(ink, state["visible"], state["valid"])
+        if ink.any() and not lines.any():
+            raise gr.Error("Draw in the occluded part, outside the highlighted object.")
+        # An empty canvas sends an all-black hint through the ControlNet.
+        sketched = lines.any()
+        use_hint(SCRIBBLE)
 
     torch.manual_seed(int(seed))
 
@@ -260,14 +359,18 @@ def generate(state, sketch, caption, cfg_text, strength, seed):
     global_rgba = torch.cat([rgb, mask], dim=0)
 
     # Refinement, as in app.py: crop around the predicted object and denoise the crop.
-    # The hint is cropped with it. Resizing blurs a line, so it is thinned again.
+    # The hint is cropped with it. Resizing blurs a line, so it is thinned again,
+    # and a box is made a clean rectangle again.
     full_rgb = to_tensor(state["full_rgb"])
     full_visible = to_tensor(state["full_visible"].astype(np.float32))
     full_lines = to_tensor(resize_mask(lines, FULL_SIZE).astype(np.float32))
     crop, bbox = crop_and_resize(torch.cat([full_rgb, full_visible, rgb, full_lines], dim=0), mask[0], min_size=256, padding_value=0)
     crop_rgb, crop_visible, crop_output, crop_ink = crop.split([3, 1, 3, 1], dim=0)
     crop_visible = (crop_visible > 0.5).float()
-    crop_lines = scribble_to_lines(crop_ink[0].numpy() > 0, crop_visible[0].numpy() > 0, np.ones((SIZE, SIZE), bool))
+    if hint_type == BOX:
+        crop_lines = tight_box_map(crop_ink[0].numpy() > 0.5)
+    else:
+        crop_lines = scribble_to_lines(crop_ink[0].numpy() > 0, crop_visible[0].numpy() > 0, np.ones((SIZE, SIZE), bool))
 
     if crop_lines.any() or not sketched:
         batch = {
@@ -288,7 +391,7 @@ def generate(state, sketch, caption, cfg_text, strength, seed):
         rgba = put_back(torch.cat([rgb, mask], dim=1)[0].float().cpu(), FULL_SIZE, FULL_SIZE, bbox)
         rgba[3] = (rgba[3] > 0.5).float()
     else:
-        gr.Warning("No sketch inside the predicted object, so refinement was skipped.")
+        gr.Warning(f"No {hint_type.lower()} inside the refinement crop, so refinement was skipped.")
         rgba = global_rgba
 
     valid = state["full_valid"]
@@ -306,8 +409,10 @@ def build_app():
         gr.Markdown(
             "# SynergyAmodal ControlNet\n"
             "**1.** Upload an image or load a dev example. **2.** Click the visible part of the object. "
-            "**3.** Sketch the hidden part, then generate. With no sketch, the ControlNet gets a blank hint. "
-            "Selecting the object again clears the sketch."
+            "**3.** Pick a hint type and draw it, then generate. "
+            "*Scribble*: sketch lines of the hidden part; with no sketch, the ControlNet gets a blank hint. "
+            "*Box*: drag a box around the hidden part; with no box, the plain SynergyAmodal UNet runs. "
+            "The canvas keeps one scribble and one box, and selecting the object again clears both."
         )
         state = gr.State()
         sketch = gr.Textbox(visible=False)
@@ -324,11 +429,12 @@ def build_app():
 
         with gr.Row():
             with gr.Column():
-                gr.Markdown("**Sketch the hidden part (optional)**")
+                hint_type = gr.Radio([SCRIBBLE, BOX], value=SCRIBBLE, label="Hint type")
+                gr.Markdown("**Draw the hint for the hidden part (optional)**")
                 drawing = gr.HTML(blank_canvas(None))
                 with gr.Row():
-                    undo_button = gr.Button("Undo stroke")
-                    clear_sketch_button = gr.Button("Clear sketch")
+                    undo_button = gr.Button("Undo stroke / remove box")
+                    clear_sketch_button = gr.Button("Clear hint")
                 caption = gr.Textbox(label="Caption of the whole object")
                 cfg_text = gr.Slider(1, 10, value=1, label="Text CFG")
                 strength = gr.Slider(0.1, 1, value=1, label="Refinement noise strength")
@@ -345,14 +451,16 @@ def build_app():
                 training_hint = gr.Image(label="Training hint of the dev example", interactive=False, height=256, width=256, format="png")
 
         image_input.upload(load_image, [image_input], [state, selection, drawing, training_hint])
-        example_button.click(load_example, [example_index], [state, selection, drawing, training_hint, caption])
+        example_button.click(load_example, [example_index, hint_type], [state, selection, drawing, training_hint, caption])
+        hint_type.change(None, [hint_type], None, js=SET_MODE_JS)
+        hint_type.change(show_training_hint, [state, hint_type], [training_hint])
         selection.select(select_object, [state, point_type], [state, selection, drawing])
         clear_button.click(clear_selection, [state], [state, selection, drawing])
         undo_button.click(None, js=UNDO_JS)
         clear_sketch_button.click(None, js=CLEAR_JS)
         generate_button.click(
             generate,
-            [state, sketch, caption, cfg_text, strength, seed],
+            [state, sketch, hint_type, caption, cfg_text, strength, seed],
             [output, global_output, mask, hint, crop_hint],
             js=READ_SKETCH_JS,
         )
@@ -375,8 +483,10 @@ def load_mask_decoder(vae, path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/controlnet_scribble.yaml")
-    parser.add_argument("--ckpt", help="defaults to the newest checkpoint from training")
+    parser.add_argument("--config", default="configs/controlnet_scribble.yaml", help="scribble ControlNet config")
+    parser.add_argument("--ckpt", help="scribble checkpoint; defaults to the newest from training")
+    parser.add_argument("--box_config", default="configs/controlnet_box.yaml")
+    parser.add_argument("--box_ckpt", help="box checkpoint; defaults to the newest from training")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7861)
@@ -387,18 +497,34 @@ if __name__ == "__main__":
 
     from datasets.hint_scribble import HintScribbleDataset
     from trainer_controlnet import ControlNetTrainer
+    from trainer_deocclusion_pseudo import InpaintingTrainer
     from zim import ZimPredictor, zim_model_registry
 
+    def newest_checkpoint(opt):
+        return max(
+            glob.glob(os.path.join(opt.output_dir, opt.experiment_name, "lightning_logs/version_*/checkpoints/*.ckpt")),
+            key=os.path.getmtime,
+        )
+
     opt = OmegaConf.load(args.config)
-    ckpt = args.ckpt or max(
-        glob.glob(os.path.join(opt.output_dir, opt.experiment_name, "lightning_logs/version_*/checkpoints/*.ckpt")),
-        key=os.path.getmtime,
-    )
+    box_opt = OmegaConf.load(args.box_config)
+    ckpt = args.ckpt or newest_checkpoint(opt)
+    box_ckpt = args.box_ckpt or newest_checkpoint(box_opt)
     print(f"Loading {ckpt}")
 
     device = args.device
     # bf16 weights, because inference already runs under bf16 autocast and this halves the memory.
     system = ControlNetTrainer.load_from_checkpoint(ckpt, map_location="cpu", opt=opt).eval()
+
+    # Both ControlNets were trained on the same frozen UNet, so only the box ControlNet's
+    # weights are loaded, into a copy of the scribble one.
+    print(f"Loading {box_ckpt}")
+    box_state_dict = torch.load(box_ckpt, map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+    box_controlnet = copy.deepcopy(system.controlnet)
+    box_controlnet.load_state_dict({k[len("controlnet."):]: v for k, v in box_state_dict.items() if k.startswith("controlnet.")})
+    del box_state_dict
+    controlnets = {SCRIBBLE: system.controlnet, BOX: box_controlnet.eval().bfloat16().to(device)}
+
     mask_decoder = load_mask_decoder(system.vae, os.path.join(os.path.dirname(opt.base_ckpt), "vae.ckpt")).bfloat16().to(device)
     system = system.bfloat16().to(device)
 
@@ -415,5 +541,7 @@ if __name__ == "__main__":
     zim = ZimPredictor(zim_model_registry["vit_l"](checkpoint=os.path.join(os.path.dirname(opt.base_ckpt), "zim_ckpts/zim_vit_l_2092")).eval())
 
     examples = HintScribbleDataset(opt.val_dataset.args.root, opt.val_dataset.args.manifest)
+    box_examples = HintScribbleDataset(box_opt.val_dataset.args.root, box_opt.val_dataset.args.manifest)
+    box_example_index = {r["identity"]["sample_id"].split("_", 1)[1]: i for i, r in enumerate(box_examples.records)}
 
     build_app().launch(server_name=args.host, server_port=args.port)

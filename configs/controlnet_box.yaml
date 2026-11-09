@@ -1,0 +1,33 @@
+experiment_name: "sd2.1_deocclusion_controlnet_box"
+output_dir: "../all_data/outputs/synergy_amodal_controlnet/logs"
+base_ckpt: "../all_data/outputs/synergy_amodal/models/ldm.ckpt"
+
+training:
+  # Same settings as the scribble ControlNet.
+  learning_rate: 1e-5
+  batch_size: 4
+  accumulate_grad_batches: 1
+  max_steps: 50000
+  num_workers: 8
+  devices: [0]
+  precision: bf16-mixed
+  save_every_n_steps: 1000
+  sample_every_n_steps: 1000
+  resume_from_checkpoint: ~
+
+  # Required by InpaintingTrainer.__init__, not used for training.
+  p_drop_condition: 0.2
+
+# The box dataset stores its hint in channel 2 of the spatial values, like the scribble
+# dataset, so the same loader gives a filled white box on black.
+dataset:
+  module: datasets.hint_scribble.HintScribbleDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+
+val_dataset:
+  module: datasets.hint_scribble.HintScribbleDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_box_v1"
+    manifest: "manifests/dev.provisional.jsonl"
