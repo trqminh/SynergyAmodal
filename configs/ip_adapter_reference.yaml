@@ -1,0 +1,44 @@
+experiment_name: "sd2.1_deocclusion_ip_adapter_reference"
+output_dir: "../all_data/outputs/synergy_amodal_ip_adapter/logs"
+base_ckpt: "../all_data/outputs/synergy_amodal/models/ldm.ckpt"
+# IP-Adapter's image encoder (h94/IP-Adapter, models/image_encoder).
+image_encoder_path: "../all_data/outputs/synergy_amodal/cache/huggingface/models--h94--IP-Adapter/snapshots/018e402774aeeddd60609b4ecdb7e298259dc729/models/image_encoder"
+num_tokens: 4
+
+training:
+  # IP-Adapter's tutorial_train.py: lr 1e-4, weight decay 1e-2, batch size 8, no warmup, no EMA.
+  learning_rate: 1e-4
+  weight_decay: 1e-2
+  batch_size: 8
+  accumulate_grad_batches: 1
+  max_steps: 50000
+  num_workers: 8
+  devices: [0]
+  precision: bf16-mixed
+  save_every_n_steps: 1000
+  sample_every_n_steps: 1000
+  resume_from_checkpoint: ~
+
+  # IP-Adapter drops the image embedding 10% of the time in all (5% alone, 5% with the text).
+  # The text keeps the 50% drop the SynergyAmodal UNet was trained with.
+  p_drop_reference: 0.1
+
+  # Required by InpaintingTrainer.__init__, not used for training.
+  p_drop_condition: 0.2
+
+# No dev manifest yet: about 1 in 50 source groups (uCO3D sequences) are held out for the sample grids.
+dataset:
+  module: datasets.hint_reference.HintReferenceDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: train
+    dev_every: 50
+
+val_dataset:
+  module: datasets.hint_reference.HintReferenceDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: dev
+    dev_every: 50
