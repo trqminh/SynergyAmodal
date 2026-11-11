@@ -1,0 +1,53 @@
+experiment_name: "sd2.1_deocclusion_union_hints"
+output_dir: "../all_data/outputs/synergy_amodal_union/logs"
+base_ckpt: "../all_data/outputs/synergy_amodal/models/ldm.ckpt"
+# IP-Adapter's image encoder (h94/IP-Adapter, models/image_encoder).
+image_encoder_path: "../all_data/outputs/synergy_amodal/cache/huggingface/models--h94--IP-Adapter/snapshots/018e402774aeeddd60609b4ecdb7e298259dc729/models/image_encoder"
+num_tokens: 4
+
+# ~ copies the ControlNet from the UNet, like the reference. To start from the scribble ControlNet instead:
+# "../all_data/outputs/synergy_amodal_controlnet/logs/sd2.1_deocclusion_controlnet_scribble/lightning_logs/version_0/checkpoints/epoch=59-step=50000.ckpt"
+init_controlnet_ckpt: ~
+
+training:
+  # Each part keeps its own learning rate: 1e-5 for the ControlNet, 1e-4 for IP-Adapter, and both used
+  # AdamW with weight decay 1e-2. Batch size 4 like the ControlNets.
+  controlnet_learning_rate: 1e-5
+  ip_adapter_learning_rate: 1e-4
+  weight_decay: 1e-2
+  batch_size: 4
+  accumulate_grad_batches: 1
+  max_steps: 50000
+  num_workers: 8
+  devices: [0]
+  precision: bf16-mixed
+  save_every_n_steps: 1000
+  sample_every_n_steps: 1000
+  resume_from_checkpoint: ~
+
+  # Uni-ControlNet's hint dropout, over box, scribble and reference together. The text keeps the 50% drop the
+  # SynergyAmodal UNet was trained with.
+  p_keep_all: 0.1
+  p_drop_all: 0.1
+  p_drop_each: 0.5
+
+  # Required by InpaintingTrainer.__init__, not used for training.
+  p_drop_condition: 0.2
+
+# No dev manifest yet: about 1 in 50 source groups (uCO3D sequences) are held out for the sample grids,
+# the same split as the IP-Adapter.
+dataset:
+  module: datasets.hint_union.HintUnionDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: train
+    dev_every: 50
+
+val_dataset:
+  module: datasets.hint_union.HintUnionDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: dev
+    dev_every: 50
