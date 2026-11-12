@@ -1,0 +1,45 @@
+experiment_name: "sd2.1_deocclusion_reference_only"
+output_dir: "../all_data/outputs/synergy_amodal_reference_only/logs"
+base_ckpt: "../all_data/outputs/synergy_amodal/models/ldm.ckpt"
+# LoRA rank on to_q, to_k, to_v and to_out of every self-attention layer.
+lora_rank: 64
+
+training:
+  # The IP-Adapter's optimizer: AdamW, lr 1e-4, weight decay 1e-2, no warmup, no EMA.
+  # Batch size 4 per GPU (~16 GB peak; 8 needs ~24 GB): the reference pass keeps its activations for the backward.
+  learning_rate: 1e-4
+  weight_decay: 1e-2
+  batch_size: 4
+  accumulate_grad_batches: 1
+  max_steps: 50000
+  num_workers: 8
+  devices: [0]
+  precision: bf16-mixed
+  save_every_n_steps: 1000
+  sample_every_n_steps: 1000
+  resume_from_checkpoint: ~
+
+  # Like the IP-Adapter, the reference is dropped 10% of the time, for classifier-free guidance.
+  # The text keeps the 50% drop the SynergyAmodal UNet was trained with.
+  p_drop_reference: 0.1
+
+  # Required by InpaintingTrainer.__init__, not used for training.
+  p_drop_condition: 0.2
+
+# No dev manifest yet: about 1 in 50 source groups (uCO3D sequences) are held out for the sample grids,
+# the same split as the IP-Adapter.
+dataset:
+  module: datasets.hint_reference.HintReferenceDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: train
+    dev_every: 50
+
+val_dataset:
+  module: datasets.hint_reference.HintReferenceDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: dev
+    dev_every: 50
