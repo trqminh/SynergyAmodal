@@ -5,6 +5,7 @@ Methods:
   controlnet  the same UNet plus a trained hint ControlNet, given each record's own hint
   ip_adapter  the same UNet plus a trained reference IP-Adapter, given each record's own reference image
   reference_only  the same UNet with training-free reference_only attention (reference_only.py), own reference image
+  reference_only_trained  the same UNet with trained reference_only attention (trainer_reference_only.py), own reference image
   union       the same UNet plus the trained union model (trainer_union.py), given box, scribble and reference together
 
 Writes <out>/preds/<sample_id>_rgb.png, <out>/preds/<sample_id>_mask.png and <out>/run.json.
@@ -38,7 +39,7 @@ from torchvision.utils import save_image
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--method', choices=['synergy', 'controlnet', 'ip_adapter', 'reference_only', 'union'], required=True)
+    parser.add_argument('--method', choices=['synergy', 'controlnet', 'ip_adapter', 'reference_only', 'reference_only_trained', 'union'], required=True)
     parser.add_argument('--config', required=True, help='a ControlNet or IP-Adapter config; gives base_ckpt and the dataset root')
     parser.add_argument('--ckpt', help='ControlNet or IP-Adapter checkpoint, for --method controlnet / ip_adapter')
     parser.add_argument('--root', help="dataset root, defaults to the config's")
@@ -52,7 +53,7 @@ def main():
     parser.add_argument('--cfg_text', type=float, default=1)
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
-    if args.method in ('controlnet', 'ip_adapter', 'union') and not args.ckpt:
+    if args.method in ('controlnet', 'ip_adapter', 'reference_only_trained', 'union') and not args.ckpt:
         parser.error(f'--ckpt is required for --method {args.method}')
 
     # Resolve user paths before moving to this folder, where the config's own paths are relative.
@@ -68,6 +69,7 @@ def main():
     from trainer_deocclusion_pseudo import InpaintingTrainer
     from trainer_ip_adapter import IPAdapterTrainer
     from trainer_union import UnionTrainer
+    from trainer_reference_only import ReferenceOnlyTrainer
     from reference_only import ReferenceOnlyInpainter
     from utils import import_str
 
@@ -104,6 +106,8 @@ def main():
         system = IPAdapterTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
     elif args.method == 'reference_only':
         system = ReferenceOnlyInpainter(opt).eval()
+    elif args.method == 'reference_only_trained':
+        system = ReferenceOnlyTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
     elif args.method == 'union':
         system = UnionTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
     else:
@@ -124,7 +128,7 @@ def main():
         batch['caption'] = [s['caption'] for s in samples]
         if args.method == 'ip_adapter':
             condition = {'clip_image': torch.stack([s['clip_image'] for s in samples]).to(device)}
-        elif args.method == 'reference_only':
+        elif args.method in ('reference_only', 'reference_only_trained'):
             condition = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('reference', 'reference_mask')}
         elif args.method == 'union':
             condition = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('box', 'scribble', 'clip_image')}
