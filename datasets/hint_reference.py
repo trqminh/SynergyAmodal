@@ -59,6 +59,7 @@ class HintReferenceDataset(torch.utils.data.Dataset):
             'amodal_image': self.load_rgb(supervision['complete_rgb']),
             'amodal_mask': self.load_mask(supervision['amodal_mask']),
             'reference': to_tensor(reference),
+            'reference_mask': self.load_mask(inputs['reference_validity']),
             'clip_image': self.clip_image_processor(images=reference, return_tensors="pt").pixel_values[0],
             'caption': inputs['text'],
         }
