@@ -1,0 +1,78 @@
+experiment_name: "sd2.1_deocclusion_union_gated_robust"
+output_dir: "../all_data/outputs/synergy_amodal_union_gated_robust/logs"
+base_ckpt: "../all_data/outputs/synergy_amodal/models/ldm.ckpt"
+# LoRA rank of the reference attention, as in configs/reference_only.yaml.
+lora_rank: 64
+
+# The gated union model (configs/union_gated.yaml) trained with wrong hints: the same start, steps and dropout, so the
+# two differ only in the training hints and the gate supervision.
+#
+# The model starts from the union model's ControlNet (box and scribble) and the reference-only LoRA.
+init_union_ckpt: "../all_data/outputs/synergy_amodal_union/logs/sd2.1_deocclusion_union_hints/lightning_logs/version_0/checkpoints/epoch=42-step=50000.ckpt"
+init_reference_ckpt: "../all_data/outputs/synergy_amodal_reference_only/eval_ckpts/epoch=26-step=21000.ckpt"
+
+training:
+  # Each part keeps its own learning rate: 1e-5 for the ControlNet (union model), 1e-4 for the reference LoRA
+  # (reference-only model) and for the new gates. AdamW with weight decay 1e-2 for all, as before.
+  controlnet_learning_rate: 1e-5
+  learning_rate: 1e-4
+  weight_decay: 1e-2
+  batch_size: 4
+  accumulate_grad_batches: 1
+  # A fine-tune from two trained models, so fewer steps than either.
+  max_steps: 20000
+  num_workers: 8
+  devices: [0]
+  precision: bf16-mixed
+  save_every_n_steps: 1000
+  sample_every_n_steps: 1000
+  resume_from_checkpoint: ~
+
+  # The union model's hint dropout, over box, scribble and reference together. The text keeps the 50% drop the
+  # SynergyAmodal UNet was trained with.
+  p_keep_all: 0.1
+  p_drop_all: 0.1
+  p_drop_each: 0.5
+
+  # Weight of the gate supervision (trainer_union_gated.py, spatial_gate_loss): box and scribble gates toward 0 where
+  # the hint is wrong and 1 where it is right. 0 trains the gates from the denoising loss alone.
+  gate_loss_weight: 0.1
+
+  # Required by InpaintingTrainer.__init__, not used for training.
+  p_drop_condition: 0.2
+
+# Clean hints for the sample grids. No dev manifest yet: about 1 in 50 source groups (uCO3D sequences) are held out for the sample grids,
+# the same split as the other models.
+# Wrong hints (hint_perturbation.py), drawn anew for every item, before the trainer's hint dropout. Half the items keep
+# right hints, so the model still learns to use them. Level ranges cover the held-out perturbed eval
+# (scripts/eval_heldout_perturbed.sh), whose fixed levels then fall inside the training ranges.
+dataset:
+  module: datasets.hint_union.HintUnionPerturbedDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: train
+    dev_every: 50
+    p_perturb: 0.5
+    p_each: 0.5
+    modes:
+      box:
+        loose: [0.1, 0.75]     # fraction of the box size
+        shift: [0.1, 0.75]
+        cut: [0.1, 0.4]
+      scribble:
+        shift: [4, 40]         # pixels at 512
+        warp: [4, 24]
+        drop: [0.2, 0.8]       # fraction of line pixels
+        add: [0.25, 1.5]
+      reference:
+        swap: ~
+        swap_other: ~
+
+val_dataset:
+  module: datasets.hint_union.HintUnionDataset
+  args:
+    root: "../all_data/datasets/hint_dataset_uco3d_ref_scribble_box_v1"
+    manifest: "manifests/train.provisional.jsonl"
+    split: dev
+    dev_every: 50

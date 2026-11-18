@@ -88,6 +88,30 @@ class ControlNetUnionModel(ControlNetModel):
         self.control_type_proj = Timesteps(control_type_embed_dim, self.config.flip_sin_to_cos, self.config.freq_shift)
         self.control_add_embedding = TimestepEmbedding(control_type_embed_dim * num_control_type, time_embed_dim)
 
+    def hint_terms(self, sample, emb, controlnet_cond, control_type_idx, conditioning_scale, **kwargs):
+        """What each hint adds to the sample: its features from the hint encoder plus a per-channel offset, which a
+        small transformer over [hint_1 + task_1, ..., hint_n + task_n, sample] gives it. The terms are summed."""
+        inputs = []
+        condition_list = []
+        for cond, control_idx, scale in zip(controlnet_cond, control_type_idx, conditioning_scale):
+            condition = self.controlnet_cond_embedding(cond)
+            feat_seq = torch.mean(condition, dim=(2, 3))
+            feat_seq = feat_seq + self.task_embedding[control_idx]
+            inputs.append(feat_seq.unsqueeze(1) * scale)
+            condition_list.append(condition * scale)
+
+        inputs.append(torch.mean(sample, dim=(2, 3)).unsqueeze(1))
+
+        x = torch.cat(inputs, dim=1)
+        for layer in self.transformer_layes:
+            x = layer(x)
+
+        terms = []
+        for idx, (condition, scale) in enumerate(zip(condition_list, conditioning_scale)):
+            alpha = self.spatial_ch_projs(x[:, idx])[:, :, None, None]
+            terms.append(condition + alpha * scale)
+        return terms
+
     def forward(
         self,
         sample,
@@ -97,12 +121,14 @@ class ControlNetUnionModel(ControlNetModel):
         control_type,
         control_type_idx,
         conditioning_scale=1.0,
+        **kwargs,
     ):
         """
         controlnet_cond: list of hint images, (B, 3, H, W) each, in [0, 1].
         control_type: (B, num_control_type), 1 where that hint is given.
         control_type_idx: the control type of each entry of controlnet_cond.
         conditioning_scale: a float, or one per hint.
+        kwargs: passed to hint_terms (used by subclasses).
         """
         if isinstance(conditioning_scale, float):
             conditioning_scale = [conditioning_scale] * len(controlnet_cond)
@@ -125,25 +151,9 @@ class ControlNetUnionModel(ControlNetModel):
         # 2. pre-process: fuse the hints into the sample
         sample = self.conv_in(sample)
 
-        inputs = []
-        condition_list = []
-        for cond, control_idx, scale in zip(controlnet_cond, control_type_idx, conditioning_scale):
-            condition = self.controlnet_cond_embedding(cond)
-            feat_seq = torch.mean(condition, dim=(2, 3))
-            feat_seq = feat_seq + self.task_embedding[control_idx]
-            inputs.append(feat_seq.unsqueeze(1) * scale)
-            condition_list.append(condition * scale)
-
-        inputs.append(torch.mean(sample, dim=(2, 3)).unsqueeze(1))
-
-        x = torch.cat(inputs, dim=1)
-        for layer in self.transformer_layes:
-            x = layer(x)
-
         controlnet_cond_fuser = sample * 0.0
-        for idx, (condition, scale) in enumerate(zip(condition_list, conditioning_scale)):
-            alpha = self.spatial_ch_projs(x[:, idx])[:, :, None, None]
-            controlnet_cond_fuser = controlnet_cond_fuser + condition + alpha * scale
+        for term in self.hint_terms(sample, emb, controlnet_cond, control_type_idx, conditioning_scale, **kwargs):
+            controlnet_cond_fuser = controlnet_cond_fuser + term
 
         sample = sample + controlnet_cond_fuser
 
