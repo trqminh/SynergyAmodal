@@ -1,14 +1,22 @@
-# Research plan: multi-hint amodal completion (CVPR)
+# Research plan: MultiHint Control, multi-hint amodal completion (CVPR)
+
+Working title: **MultiHint Control** (as in the teaser). "Any hint" describes the input (any subset of the hints), not
+the model.
 
 ## Contributions
 
 1. **Setting:** amodal completion guided by any combination of hints (box, scribble, reference image, text).
 2. **Dataset:** the training set and the benchmark.
-3. **Model:** one model that takes any subset of the hints.
+3. **Model: reliability-aware multi-hint control.** One model that takes any subset of the hints and, for each hint and
+   each pixel, estimates how far to trust it, given the visible region, the other hints and each hint's validity. It
+   is trained with perturbed and conflicting hints, so hints act as soft evidence and the visible region as a hard
+   constraint. At inference, a user control trades following the hints closely against following what the visible
+   region implies.
 
-The current model (ControlNet-Union for box and scribble, plus IP-Adapter or reference attention for the reference) is a
-solid baseline. As a contribution, though, it reads as "ControlNet++ plus a ReferenceNet". The model's novelty should
-come from what is specific to this setting, not from swapping in newer modules.
+The plain union model (ControlNet-Union for box and scribble, plus IP-Adapter or reference attention for the reference)
+is a solid baseline. As a contribution, though, it reads as "ControlNet++ plus a ReferenceNet". The model's novelty
+comes from what is specific to this setting (hints that are partial and can be wrong), not from swapping in newer
+modules.
 
 ## What makes this setting different
 
@@ -26,8 +34,17 @@ come from what is specific to this setting, not from swapping in newer modules.
 Generic controllable generation (ControlNet and its successors) treats a hint as a dense, trusted input. That gap is
 the opening for contribution 3.
 
-**Story:** hints as partial evidence. The model trusts the visible region fully and treats each hint according to how
-reliable it is, everywhere in the image.
+**Story:** hints as partial evidence. The visible pixels are always kept. The occluded part should continue what the
+visible region implies, and each hint pulls it toward the hint instead. How far it follows each hint is set by that
+hint's reliability:
+- **Learned, per hint and per pixel:** gate maps (0 = ignore the hint there and continue the visible region, 1 = follow
+  the hint). A scribble that cuts against the visible contour is turned down there and followed where it fits; a
+  reference is used where it is valid and agrees with the visible appearance.
+- **User control on top:** one knob that scales the gates (or per-hint guidance weights), toward "follow my hints" or
+  toward "follow the visible region".
+
+Step 1 shows that a single global weight is not enough: the plain model over-trusts the scribble and under-trusts the
+box and the reference.
 
 ## Status (2026-11-12)
 
@@ -46,11 +63,17 @@ reliable it is, everywhere in the image.
 Find out how the current union model fails before designing anything new. Build the method around the failures that
 actually occur.
 
-- [ ] Write a hint perturbation tool for the held-out set:
-  - [ ] Box: looser boxes, shifted boxes, boxes that cut off part of the object.
-  - [ ] Scribble: shifted strokes, strokes partly removed, false strokes added.
-  - [ ] Reference: a large view gap, a reference of a different object (to test conflicts).
-  - [ ] Conflicts: hints that contradict the visible region or each other.
+- [x] Write a hint perturbation tool for the held-out set (`hint_perturbation.py`, `eval_heldout.py --perturb`,
+      `scripts/show_perturbations.py`, `scripts/eval_heldout_perturbed.sh`):
+  - [x] Box: looser boxes, shifted boxes, boxes that cut off part of the occluded region.
+  - [x] Scribble: shifted lines, a smooth warp, strokes erased, false strokes from another object of the same
+        category.
+  - [x] Reference: another object of the same category, or of another super category. The view gap is not perturbed:
+        the test set already spans 60–120°, so results are split by `audit.reference.view_gap_deg`.
+  - [x] Conflicts: all three hints are always given, so one wrong hint conflicts with the right ones and the visible
+        region; sets of several specs (e.g. `scribble:shift:16+reference:swap`) make two hints wrong.
+  - Each perturbation also gives where the hint is wrong (false and missing maps), for the metrics and later for gate
+    supervision.
 - [ ] Run the union model on clean and perturbed hints.
 - [ ] Measure:
   - Over-obedience: does it copy wrong hints literally?
@@ -59,6 +82,19 @@ actually occur.
 - [ ] Make the motivation figure from the clearest failures.
 
 **Decision point:** if the model already handles perturbed hints well, change the story before building step 2.
+
+**Result (2026-11-14):** union model (IP-Adapter reference) at step 50k, layer 0 (2000 records), `cfg_text` 3, same
+noise in every set. Scores: `all_data/outputs/synergy_amodal_union/eval_heldout/perturbed/step50000/scores/summary.md`
+(`scripts/collect_perturbed_eval.py` in the workspace).
+- Scribble is obeyed literally: with lines shifted 16 px, predicted lines trace 74% of the wrong line pixels (4% with
+  clean hints), true-line recall drops from 0.90 to 0.29 and hidden IoU from 0.97 to 0.79. Already at 8 px (just past
+  the 3 px tolerance) hidden IoU drops by 0.10. False strokes are drawn 41% of the time.
+- Box is close to ignored: a loose or shifted box adds no mask, a cut box removes almost none.
+- Reference is under-used: swapping in another object's reference moves CLIP similarity to it by under 0.01, and
+  results do not change with the view gap.
+- The visible region never drifts (visible PSNR and LPIPS unchanged).
+- So the decision is to go on with step 2. Next: the same suite on the union model with reference attention, to see
+  whether a reference that is actually used is also copied when wrong.
 
 ### Step 2: one model contribution, reliability-aware hint fusion
 
@@ -70,7 +106,10 @@ actually occur.
   - Inputs: `valid_canvas`, `reference_validity`, the scribble tolerance, and the noisy features.
   - The gate maps should be easy to read, so they can be a figure.
 - [ ] **Robust training:** hint perturbation and conflicting hints during training, so hints are treated as soft
-      evidence and the visible region as hard.
+      evidence and the visible region as hard. Optional gate supervision from the perturbation tool's false and
+      missing maps (target 0 where the hint is wrong, 1 where it is right).
+- [ ] **User control:** an inference-time knob that scales the learned gates, from "follow the visible region" to
+      "follow the hints".
 - [ ] **Hint dropout:** Uni-ControlNet dropout over all hints. A dropped reference uses `control.drop` for that sample.
 - [ ] **Initialization:** the ControlNet from the union checkpoint, the LoRA from the reference-only checkpoint, then a
       short joint fine-tune.
