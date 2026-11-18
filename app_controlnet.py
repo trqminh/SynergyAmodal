@@ -25,7 +25,10 @@ FULL_SIZE = 1024
 
 SCRIBBLE, BOX, REFERENCE = "Scribble", "Box", "Reference"
 # Separate: one model per hint type. Union: one model for any subset of the three hints (trainer_union.py).
-SEPARATE, UNION = "Separate models", "Union"
+# Reference-only: the reference through the UNet's own self-attention, with trained LoRA (trainer_reference_only.py).
+SEPARATE, UNION, REF_ONLY = "Separate models", "Union", "Reference-only (trained)"
+# The uCO3D references: a square crop of the object on white, at this size.
+REFERENCE_SIZE = 224
 SYNERGY_EXAMPLES, UCO3D_EXAMPLES = "SynergyAmodal dev (scribble, box)", "uCO3D dev (scribble, box, reference)"
 
 # A plain canvas, shown 1:1 over the image, so a canvas pixel is a hint pixel.
@@ -112,8 +115,11 @@ READ_SKETCH_JS = """(state, sketch, model, hints, reference, caption, cfg_text, 
 }"""
 
 system = None
-# Every model runs on the same frozen UNet. Keyed by None (the plain UNet), a hint type, or UNION.
+# Every model runs on the same frozen UNet. Keyed by None (the plain UNet), a hint type, UNION or REF_ONLY.
 models = {}
+# The reference-only model's LoRA on the UNet's self-attention, as (parent, name, base layer, LoRA layer).
+# The LoRA is only in the UNet while that model runs; the other models were trained on the plain UNet.
+lora_swaps = []
 image_processor = None
 mask_decoder = None
 zim = None
@@ -192,9 +198,13 @@ def use_model(kind):
     system.inference_ddim = types.MethodType(model["cls"].inference_ddim, system)
     if hasattr(model["cls"], "predict_noise"):
         system.predict_noise = types.MethodType(model["cls"].predict_noise, system)
-    for name in ("controlnet", "image_proj_model"):
+    for name in model.get("methods", ()):
+        setattr(system, name, types.MethodType(getattr(model["cls"], name), system))
+    for name in ("controlnet", "image_proj_model", "control"):
         if name in model:
             setattr(system, name, model[name])
+    for parent, name, base, lora in lora_swaps:
+        setattr(parent, name, lora if model.get("lora") else base)
     # IP-Adapter's processors read the image tokens off the end of the text tokens, so each model brings its own.
     # set_attn_processor pops from the dict it gets, hence the copy.
     system.unet.set_attn_processor(dict(model["processors"]))
@@ -230,6 +240,24 @@ def to_uint8(image):
 def to_hint(lines):
     # White lines on black in [0, 1], repeated to 3 channels, like the training hint.
     return to_tensor(lines.astype(np.float32))[None].repeat(1, 3, 1, 1).to(device)
+
+
+def reference_tensors(state, reference):
+    # The reference and its object mask, for the reference-only model.
+    rgb = np.array(reference.convert("RGB"))
+    if state.get("reference") is not None and np.array_equal(rgb, state["reference"]):
+        # A uCO3D example's reference, with its own mask.
+        mask = state["reference_mask"]
+    else:
+        # Like the uCO3D references: padded to a square on white and resized. The object's mask is not known,
+        # so on a white background it is everything not white (on uCO3D, 99% the same as the real mask).
+        h, w = rgb.shape[:2]
+        side = max(h, w)
+        square = np.full((side, side, 3), 255, np.uint8)
+        square[(side - h) // 2:(side - h) // 2 + h, (side - w) // 2:(side - w) // 2 + w] = rgb
+        rgb = np.array(Image.fromarray(square).resize((REFERENCE_SIZE, REFERENCE_SIZE), Image.Resampling.BICUBIC))
+        mask = (rgb < 250).any(-1)
+    return to_tensor(rgb)[None].to(device), to_tensor(mask.astype(np.float32))[None].to(device)
 
 
 def hint_view(box, scribble, drawn):
@@ -310,6 +338,8 @@ def load_example(example_set, index, hint_type):
         state["training_hints"][SCRIBBLE] = (sample["scribble"][0].numpy() * 255).astype(np.uint8)
         state["training_hints"][BOX] = (sample["box"][0].numpy() * 255).astype(np.uint8)
         reference = Image.open(examples.root / record["inputs"]["reference"]).convert("RGB")
+        state["reference"] = np.array(reference)
+        state["reference_mask"] = examples.load_mask(record["inputs"]["reference_validity"])[0].numpy() > 0
     else:
         # The box dataset has the same observation for this object, so both training hints can be shown.
         state["training_hints"][SCRIBBLE] = (sample["hint"][0].numpy() * 255).astype(np.uint8)
@@ -368,7 +398,12 @@ def generate(state, sketch, model, hints, reference, caption, cfg_text, strength
             raise gr.Error("Upload a reference image, or load a uCO3D example.")
         clip_image = image_processor(images=reference.convert("RGB"), return_tensors="pt").pixel_values.to(device)
 
-    if model == UNION:
+    if model == REF_ONLY:
+        if hints != {REFERENCE}:
+            raise gr.Error("The reference-only model takes the reference alone. Check only Reference.")
+        reference_image, reference_mask = reference_tensors(state, reference)
+        kind = REF_ONLY
+    elif model == UNION:
         # The union model was trained with any subset of the hints, so an empty box or scribble is left out.
         for name, hint_map in ((BOX, box), (SCRIBBLE, scribble)):
             if name in hints and not hint_map.any():
@@ -403,6 +438,8 @@ def generate(state, sketch, model, hints, reference, caption, cfg_text, strength
             return {"hint": to_hint(box)}
         if kind == REFERENCE:
             return {"clip_image": clip_image}
+        if kind == REF_ONLY:
+            return {"reference": reference_image, "reference_mask": reference_mask}
         return {}
 
     torch.manual_seed(int(seed))
@@ -480,6 +517,8 @@ def build_app():
             "*Reference*: another view of the object, ideally cropped on white like the uCO3D examples. "
             "The separate models take one hint at a time; the union model takes any of them together "
             "and leaves out an empty box or scribble. "
+            "The trained reference-only model takes the reference alone; for an uploaded reference, "
+            "everything not white counts as the object. "
             "The canvas keeps one scribble and one box, and selecting the object again clears both."
         )
         state = gr.State()
@@ -498,7 +537,7 @@ def build_app():
 
         with gr.Row():
             with gr.Column():
-                model = gr.Radio([SEPARATE] + ([UNION] if UNION in models else []), value=SEPARATE, label="Model")
+                model = gr.Radio([SEPARATE] + [name for name in (UNION, REF_ONLY) if name in models], value=SEPARATE, label="Model")
                 hints = gr.CheckboxGroup([SCRIBBLE, BOX, REFERENCE], value=[SCRIBBLE], label="Hints to use")
                 hint_type = gr.Radio([SCRIBBLE, BOX], value=SCRIBBLE, label="Draw on the canvas")
                 gr.Markdown("**Draw the hint for the hidden part (optional)**")
@@ -506,7 +545,7 @@ def build_app():
                 with gr.Row():
                     undo_button = gr.Button("Undo stroke / remove box")
                     clear_sketch_button = gr.Button("Clear hint")
-                reference = gr.Image(type="pil", label="Reference image", sources=["upload", "clipboard"], height=256, width=256)
+                reference = gr.Image(type="pil", label="Reference image", sources=["upload", "clipboard"], height=256, width=256, format="png")
                 caption = gr.Textbox(label="Caption of the whole object")
                 cfg_text = gr.Slider(1, 10, value=1, label="Text CFG")
                 strength = gr.Slider(0.1, 1, value=1, label="Refinement noise strength")
@@ -581,6 +620,8 @@ if __name__ == "__main__":
     parser.add_argument("--ref_ckpt", help="reference IP-Adapter checkpoint; defaults to the newest from training")
     parser.add_argument("--union_config", default="configs/union_hints.yaml")
     parser.add_argument("--union_ckpt", help="union checkpoint; defaults to the newest from training, if there is one")
+    parser.add_argument("--ref_only_config", default="configs/reference_only.yaml")
+    parser.add_argument("--ref_only_ckpt", help="trained reference_only checkpoint; defaults to the newest from training, if there is one")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7861)
@@ -598,6 +639,7 @@ if __name__ == "__main__":
     from trainer_controlnet import ControlNetTrainer
     from trainer_deocclusion_pseudo import InpaintingTrainer
     from trainer_ip_adapter import IPAdapterTrainer
+    from trainer_reference_only import LoRALinear, ReferenceOnlyTrainer, add_reference_attn
     from trainer_union import UnionTrainer
     from zim import ZimPredictor, zim_model_registry
 
@@ -616,10 +658,12 @@ if __name__ == "__main__":
     box_opt = OmegaConf.load(args.box_config)
     ref_opt = OmegaConf.load(args.ref_config)
     union_opt = OmegaConf.load(args.union_config)
+    ref_only_opt = OmegaConf.load(args.ref_only_config)
     ckpt = args.ckpt or newest_checkpoint(opt)
     box_ckpt = args.box_ckpt or newest_checkpoint(box_opt)
     ref_ckpt = args.ref_ckpt or newest_checkpoint(ref_opt)
     union_ckpt = args.union_ckpt or newest_checkpoint(union_opt)
+    ref_only_ckpt = args.ref_only_ckpt or newest_checkpoint(ref_only_opt)
     print(f"Loading {ckpt}")
 
     device = args.device
@@ -659,6 +703,34 @@ if __name__ == "__main__":
     else:
         print("No union checkpoint, so the union model is not available.")
 
+    if ref_only_ckpt is not None:
+        # trainer_reference_only.py's processors and LoRA on every self-attention layer, then the LoRA taken
+        # out again, after the union ControlNet was copied from the plain UNet. use_model puts it back.
+        system.unet.set_attn_processor(dict(default_processors))
+        ref_only_control = ReferenceOnlyTrainer.control_cls()
+        add_reference_attn(system.unet, ref_only_control, ref_only_opt.lora_rank, ReferenceOnlyTrainer.processor_cls)
+        ref_only_processors = dict(system.unet.attn_processors)
+        lora = {k[len("unet."):]: v for k, v in load_state_dict(ref_only_ckpt).items()
+                if k.startswith("unet.") and ".attn1." in k and k.endswith((".down.weight", ".up.weight"))}
+        missing, unexpected = system.unet.load_state_dict(lora, strict=False)
+        assert lora and not unexpected and not any(k.endswith((".down.weight", ".up.weight")) for k in missing), (unexpected, missing)
+        for name, module in list(system.unet.named_modules()):
+            if isinstance(module, LoRALinear):
+                parent, child = name.rsplit(".", 1)
+                lora_swaps.append((system.unet.get_submodule(parent), child, module.base, module))
+        for parent, child, base, _ in lora_swaps:
+            setattr(parent, child, base)
+        models[REF_ONLY] = {
+            "cls": ReferenceOnlyTrainer,
+            "methods": ("reference_input", "write_reference"),
+            "control": ref_only_control,
+            "lora": True,
+            "processors": ref_only_processors,
+        }
+        del lora
+    else:
+        print("No reference_only checkpoint, so the trained reference-only model is not available.")
+
     system.unet.set_attn_processor(dict(default_processors))
 
     # Only what is on the system now moves with it below, so the rest is moved here.
@@ -669,6 +741,10 @@ if __name__ == "__main__":
         for processor in model["processors"].values():
             if isinstance(processor, nn.Module):
                 processor.bfloat16().to(device)
+    # Only the LoRA's own layers: the base layers in them are the UNet's, which moves with the system.
+    for _, _, _, lora in lora_swaps:
+        lora.down.bfloat16().to(device)
+        lora.up.bfloat16().to(device)
 
     mask_decoder = load_mask_decoder(system.vae, os.path.join(os.path.dirname(opt.base_ckpt), "vae.ckpt")).bfloat16().to(device)
     system = system.bfloat16().to(device)

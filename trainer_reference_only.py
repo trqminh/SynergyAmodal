@@ -80,14 +80,14 @@ class ReferenceAttnProcessor:
         return self.processor(attn, hidden_states, encoder_hidden_states, attention_mask, temb)
 
 
-def add_reference_attn(unet, control, rank):
-    """Puts a ReferenceAttnProcessor and LoRA on every self-attention layer. Returns the LoRA layers."""
+def add_reference_attn(unet, control, rank, processor_cls=ReferenceAttnProcessor):
+    """Puts a processor_cls and LoRA on every self-attention layer. Returns the LoRA layers."""
     processors = dict(unet.attn_processors)
     lora_layers = nn.ModuleList()
     for name in processors:
         if not name.endswith('attn1.processor'):
             continue
-        processors[name] = ReferenceAttnProcessor(control)
+        processors[name] = processor_cls(control)
         control.processors.append(processors[name])
 
         attn = unet.get_submodule(name[:-len('.processor')])
@@ -102,6 +102,10 @@ def add_reference_attn(unet, control, rank):
 
 
 class ReferenceOnlyTrainer(InpaintingTrainer):
+    # Subclasses can swap in their own attention control and processor.
+    control_cls = ReferenceAttnControl
+    processor_cls = ReferenceAttnProcessor
+
     def __init__(self, opt):
         super().__init__(opt)
 
@@ -112,8 +116,8 @@ class ReferenceOnlyTrainer(InpaintingTrainer):
         del self.model_ema
         self.unet.requires_grad_(False).eval()
 
-        self.control = ReferenceAttnControl()
-        lora_layers = add_reference_attn(self.unet, self.control, opt.lora_rank)
+        self.control = self.control_cls()
+        lora_layers = add_reference_attn(self.unet, self.control, opt.lora_rank, self.processor_cls)
         self.lora_params = [p for layer in lora_layers for p in [layer.down.weight, layer.up.weight]]
 
     def configure_optimizers(self):
