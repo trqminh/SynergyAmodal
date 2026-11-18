@@ -7,8 +7,15 @@ Methods:
   reference_only  the same UNet with training-free reference_only attention (reference_only.py), own reference image
   reference_only_trained  the same UNet with trained reference_only attention (trainer_reference_only.py), own reference image
   union       the same UNet plus the trained union model (trainer_union.py), given box, scribble and reference together
+  union_reference_attn  the union model's ControlNet (box, scribble) and trained reference_only attention (reference),
+              combined without training: trainer_union_gated.py with every gate set to 1 (init checkpoints from the config)
+  union_gated the same, trained with gates (trainer_union_gated.py)
 
 Writes <out>/preds/<sample_id>_rgb.png, <out>/preds/<sample_id>_mask.png and <out>/run.json.
+
+--perturb SPEC (repeatable, see hint_perturbation.py) makes the given hints wrong, e.g. --perturb scribble:shift:16.
+The perturbed box and scribble, where they are wrong, and what was done go to <out>/hints/. The noise is the same as
+in the clean run, so the two can be compared record by record.
 The mask comes from the mask decoder, as in app_controlnet.py. Records whose predictions already
 exist are skipped, so an interrupted run resumes with the same noise.
 Metrics are computed by scripts/collect_heldout_eval.py in the parent workspace, not here.
@@ -19,6 +26,9 @@ Usage:
   python eval_heldout.py --method ip_adapter --config configs/ip_adapter_reference.yaml --ckpt CKPT \
       --root DATASET_ROOT --manifest manifests/test.provisional.jsonl --out OUT
   python eval_heldout.py --method union --config configs/union_hints.yaml --ckpt CKPT \
+      --root DATASET_ROOT --manifest manifests/test.provisional.jsonl --layer 0 --out OUT
+  python eval_heldout.py --method union ... --perturb scribble:shift:16 --perturb reference:swap --out OUT
+  python eval_heldout.py --method union_reference_attn --config configs/union_gated.yaml \
       --root DATASET_ROOT --manifest manifests/test.provisional.jsonl --layer 0 --out OUT
 """
 import argparse
@@ -39,7 +49,8 @@ from torchvision.utils import save_image
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--method', choices=['synergy', 'controlnet', 'ip_adapter', 'reference_only', 'reference_only_trained', 'union'], required=True)
+    parser.add_argument('--method', choices=['synergy', 'controlnet', 'ip_adapter', 'reference_only', 'reference_only_trained', 'union',
+                                                 'union_reference_attn', 'union_gated'], required=True)
     parser.add_argument('--config', required=True, help='a ControlNet or IP-Adapter config; gives base_ckpt and the dataset root')
     parser.add_argument('--ckpt', help='ControlNet or IP-Adapter checkpoint, for --method controlnet / ip_adapter')
     parser.add_argument('--root', help="dataset root, defaults to the config's")
@@ -52,8 +63,12 @@ def main():
     parser.add_argument('--steps', type=int, default=25)
     parser.add_argument('--cfg_text', type=float, default=1)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--perturb', action='append', default=[], help='a hint perturbation (hint_perturbation.py), '
+                        'e.g. box:loose:0.5, scribble:shift:16, reference:swap; repeat for several hints')
+    parser.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
+                        help='override a config value, e.g. init_reference_ckpt=PATH (paths relative to SynergyAmodal/)')
     args = parser.parse_args()
-    if args.method in ('controlnet', 'ip_adapter', 'reference_only_trained', 'union') and not args.ckpt:
+    if args.method in ('controlnet', 'ip_adapter', 'reference_only_trained', 'union', 'union_gated') and not args.ckpt:
         parser.error(f'--ckpt is required for --method {args.method}')
 
     # Resolve user paths before moving to this folder, where the config's own paths are relative.
@@ -69,11 +84,13 @@ def main():
     from trainer_deocclusion_pseudo import InpaintingTrainer
     from trainer_ip_adapter import IPAdapterTrainer
     from trainer_union import UnionTrainer
+    from trainer_union_gated import GatedUnionTrainer
     from trainer_reference_only import ReferenceOnlyTrainer
     from reference_only import ReferenceOnlyInpainter
+    from hint_perturbation import HintPerturber
     from utils import import_str
 
-    opt = OmegaConf.load(config)
+    opt = OmegaConf.merge(OmegaConf.load(config), OmegaConf.from_dotlist(args.set))
     dataset_args = dict(opt.dataset.args)
     dataset_args['manifest'] = args.manifest
     if root:
@@ -81,6 +98,8 @@ def main():
     # The reference loader's train/dev split only applies to its training manifest.
     dataset_args.pop('split', None)
     dataset = import_str(opt.dataset.module)(**dataset_args)
+    # Donors for swapped references and false strokes come from the whole manifest, not only the evaluated layer.
+    perturber = HintPerturber(dataset, args.perturb, seed=args.seed, donor_records=list(dataset.records)) if args.perturb else None
     if args.layer is not None:
         # Same manifest order, so batches (and their noise) match earlier runs made on that layer alone.
         layers = json.loads((Path(dataset_args['root']) / 'manifests/layers.json').read_text())['layers']
@@ -91,6 +110,9 @@ def main():
 
     preds = out / 'preds'
     preds.mkdir(parents=True, exist_ok=True)
+    if perturber:
+        hints_dir = out / 'hints'
+        hints_dir.mkdir(exist_ok=True)
 
     def done(i):
         return all((preds / f'{sample_ids[i]}_{k}.png').exists() for k in ('rgb', 'mask'))
@@ -110,6 +132,11 @@ def main():
         system = ReferenceOnlyTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
     elif args.method == 'union':
         system = UnionTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
+    elif args.method == 'union_reference_attn':
+        system = GatedUnionTrainer(opt).eval()
+        system.open_gates()
+    elif args.method == 'union_gated':
+        system = GatedUnionTrainer.load_from_checkpoint(ckpt, map_location='cpu', opt=opt).eval()
     else:
         # The constructor loads the SynergyAmodal EMA UNet from base_ckpt; the new ControlNet is never used.
         system = ControlNetTrainer(opt).eval()
@@ -124,6 +151,12 @@ def main():
     started = datetime.now(timezone.utc).isoformat()
     for n, indices in enumerate(todo):
         samples = [dataset[i] for i in indices]
+        if perturber:
+            for i, s in zip(indices, samples):
+                missing = {hint for _, hint, _, _ in perturber.specs} - set(s) - {'reference'}
+                assert not missing, f'{opt.dataset.module} does not load {missing}: use a config with HintUnionDataset'
+                perturber(i, s)
+                perturber.save(s, sample_ids[i], hints_dir)
         batch = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('image', 'modal_mask')}
         batch['caption'] = [s['caption'] for s in samples]
         if args.method == 'ip_adapter':
@@ -132,6 +165,9 @@ def main():
             condition = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('reference', 'reference_mask')}
         elif args.method == 'union':
             condition = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('box', 'scribble', 'clip_image')}
+        elif args.method in ('union_reference_attn', 'union_gated'):
+            # No validity, like the union model: valid_canvas is the whole canvas for the box anyway.
+            condition = {k: torch.stack([s[k] for s in samples]).to(device) for k in ('box', 'scribble', 'reference', 'reference_mask')}
         elif args.method == 'controlnet':
             condition = {'hint': torch.stack([s['hint'] for s in samples]).to(device)}
         else:
@@ -153,6 +189,7 @@ def main():
         'checkpoint': ckpt,
         'base_ckpt': str(Path(opt.base_ckpt).resolve()),
         'config': str(config),
+        'config_overrides': args.set,
         'dataset_root': str(Path(dataset_args['root']).resolve()),
         'manifest': args.manifest,
         'layer': args.layer,
@@ -161,6 +198,7 @@ def main():
         'steps': args.steps,
         'cfg_text': args.cfg_text,
         'seed': args.seed,
+        'perturb': args.perturb,
         'batch_size': args.batch_size,
         'uses_text': True,
         'uses_hint': args.method != 'synergy',
